@@ -1,0 +1,4 @@
+https://www.dropbox.com/scl/fi/sakjsyqp7x7164h68pmam/test_hogares.csv?rlkey=sh8hs0rt1so4cufav0yo8btom&st=5h68pi3u&dl=0
+https://www.dropbox.com/scl/fi/bxuc9befzrbt27ajxlpvu/test_personas.csv?rlkey=jh1d6jru4f0jx8ldnqyqshmvh&st=goozkh1y&dl=0
+https://www.dropbox.com/scl/fi/kzpccqa6gwtzx0e79iqct/train_hogares.csv?rlkey=ala8b4z6u295zan684zw0zyfb&st=zc3dyrlx&dl=0
+https://www.dropbox.com/scl/fi/pch52dyx8gilx4rtvmgnw/train_personas.csv?rlkey=tfzax7opjw39va52wf5orz5od&st=ty1xu444&dl=0
