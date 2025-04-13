@@ -1,6 +1,6 @@
 ---
 title: "Predicción de la Pobreza en Colombia - Taller 2 BDML"
-author: "Sara Rojas y [Tu Nombre]"
+author: "Sara Rocio Rojas y Lina María Álvarez"
 output:
   html_document:
     toc: true
