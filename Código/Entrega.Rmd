@@ -1,0 +1,590 @@
+---
+title: "Predicción de la pobreza en Colombia - Taller 2 BDML"
+author: "Sara Rojas y Lina Alvarez"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Introducción
+
+La pobreza sigue siendo una de las problemáticas más relevantes en la formulación de políticas públicas en Colombia. Este documento presenta el desarrollo del Taller 2 de la materia Big Data y Machine Learning (ECON4676), cuyo objetivo es construir un modelo predictivo para identificar hogares en situación de pobreza, a partir de datos suministrados por el DANE. Usamos algoritmos de clasificación y abordamos aspectos como desbalance de clases, tuning de hiperparámetros y comparación de modelos. La evaluación de desempeño se realiza con la métrica F1-score y las predicciones son validadas en la plataforma Kaggle.
+
+# 2. Datos
+
+#2.01 Instalar paquetes
+```{r}
+require(pacman)
+p_load(tidyverse,
+       janitor,
+       readr,
+       glmnet,
+       pROC,
+       gridExtra)
+```
+
+## 2.1 Descarga de las bases de datos
+
+```{r}
+train_p <- read_csv("https://www.dropbox.com/scl/fi/pch52dyx8gilx4rtvmgnw/train_personas.csv?rlkey=tfzax7opjw39va52wf5orz5od&st=aybcoq48&dl=1") %>% clean_names()
+train_h <- read_csv("https://www.dropbox.com/scl/fi/kzpccqa6gwtzx0e79iqct/train_hogares.csv?rlkey=ala8b4z6u295zan684zw0zyfb&st=slkkf6kt&dl=1") %>% clean_names()
+test_p  <- read_csv("https://www.dropbox.com/scl/fi/bxuc9befzrbt27ajxlpvu/test_personas.csv?rlkey=jh1d6jru4f0jx8ldnqyqshmvh&st=i70qnf7j&dl=1") %>% clean_names()
+test_h  <- read_csv("https://www.dropbox.com/scl/fi/sakjsyqp7x7164h68pmam/test_hogares.csv?rlkey=sh8hs0rt1so4cufav0yo8btom&st=t51wnslq&dl=1") %>% clean_names()
+```
+
+Este bloque descarga directamente desde Dropbox las cuatro bases proporcionadas para el taller: `train_personas`, `train_hogares`, `test_personas` y `test_hogares`, y las estandariza con `clean_names()` para trabajar con nombres de variables consistentes en R.
+
+## 2.2 Preparación de la muestra
+
+```{r}
+#-------------------------------------------------------------------------#
+# ORGANIZACIÓN DE LA DATA Y UNIÓN DE BASES
+#-------------------------------------------------------------------------#
+
+# Train:
+vars_hogar_extra <- train_p %>%
+  mutate(
+    edad_laboral = p6040 >= 12 & p6040 <= 65,
+    mujer = ifelse(p6020 == 2, 1, 0),
+    menor_6 = ifelse(p6040 < 6, 1, 0),
+    inactivo_pet = ifelse(edad_laboral, ina, NA)
+  ) %>%
+  group_by(id) %>%
+  summarise(
+    n_personas = n(),
+    n_ninos = sum(p6040 < 12, na.rm = TRUE),
+    n_mayores = sum(p6040 >= 65, na.rm = TRUE),
+    prop_ocupados = sum(oc == 1 & edad_laboral, na.rm = TRUE) / sum(edad_laboral, na.rm = TRUE),
+    educacion_max = max(p6210, na.rm = TRUE),
+    educacion_prom = mean(p6210, na.rm = TRUE),
+    edad_jefe = p6040[orden == 1],
+    sexo_jefe = p6020[orden == 1],
+    n_mujeres = sum(mujer, na.rm = TRUE),
+    n_menores_6 = sum(menor_6, na.rm = TRUE),
+    ocupados_total = sum(oc == 1, na.rm = TRUE),
+    prop_inactivos_pet = sum(inactivo_pet == 1, na.rm = TRUE) / sum(!is.na(inactivo_pet))
+  )
+
+train_modelo_ext <- train_h %>%
+  left_join(vars_hogar_extra, by = "id")
+
+vars_modelo_ext <- train_modelo_ext %>%
+  select(
+    pobre,
+    n_personas, n_ninos, n_mayores, prop_ocupados,
+    educacion_max, educacion_prom, edad_jefe, sexo_jefe,
+    n_mujeres, n_menores_6, ocupados_total, prop_inactivos_pet
+  ) %>%
+  mutate(across(.cols = everything(), .fns = ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+vars_modelo_ext$pobre = as.factor(vars_modelo_ext$pobre)
+
+# Test:
+vars_test_ext <- test_p %>%
+  mutate(
+    edad_laboral = p6040 >= 12 & p6040 <= 65,
+    mujer = ifelse(p6020 == 2, 1, 0),
+    menor_6 = ifelse(p6040 < 6, 1, 0),
+    inactivo_pet = ifelse(edad_laboral, ina, NA)
+  ) %>%
+  group_by(id) %>%
+  summarise(
+    n_personas = n(),
+    n_ninos = sum(p6040 < 12, na.rm = TRUE),
+    n_mayores = sum(p6040 >= 65, na.rm = TRUE),
+    prop_ocupados = sum(oc == 1 & edad_laboral, na.rm = TRUE) / sum(edad_laboral, na.rm = TRUE),
+    educacion_max = max(p6210, na.rm = TRUE),
+    educacion_prom = mean(p6210, na.rm = TRUE),
+    edad_jefe = p6040[orden == 1],
+    sexo_jefe = p6020[orden == 1],
+    n_mujeres = sum(mujer, na.rm = TRUE),
+    n_menores_6 = sum(menor_6, na.rm = TRUE),
+    ocupados_total = sum(oc == 1, na.rm = TRUE),
+    prop_inactivos_pet = sum(inactivo_pet == 1, na.rm = TRUE) / sum(!is.na(inactivo_pet))
+  )
+
+test_modelo_ext <- test_h %>%
+  left_join(vars_test_ext, by = "id") %>%
+  mutate(across(.cols = -id, .fns = ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+X_vars_test_ext_full <- model.matrix(~ . - id -1, data = test_modelo_ext)
+```
+## 2.3 Estadísticas descriptivas y visualización
+
+```{r}
+# Este bloque se enfoca únicamente en la creación del df para las gráficas exploratorias
+# y no será utilizado para el entrenamiento de modelos.
+
+p_load(forcats)
+
+df <- train_p %>%
+  group_by(id) %>%
+  summarise(
+    n_personas = n(),
+    mujer = sum(p6020 == 2, na.rm = TRUE),
+    hombre = sum(p6020 == 1, na.rm = TRUE),
+    niños = sum(p6040 < 12, na.rm = TRUE),
+    mayores = sum(p6040 >= 65, na.rm = TRUE),
+    ocupados = sum(p6240 == 1, na.rm = TRUE),
+    educ_sup = sum(p6210 %in% c(8, 9), na.rm = TRUE),
+    edad_promedio = mean(p6040, na.rm = TRUE),
+    nivel_educativo = mean(p6210, na.rm = TRUE)
+  ) %>%
+  mutate(prop_ocupados = ocupados / n_personas)
+
+df <- left_join(train_h, df, by = "id")
+glimpse(df)
+
+# Gráficos: secciones comentadas cada tres visualizaciones
+
+# Tamaño del hogar, número de ocupados y nivel educativo
+p1 <- ggplot(df, aes(x = factor(pobre), y = n_personas)) +
+  geom_boxplot(fill = "#0072CE", alpha = 0.6) +
+  labs(x = "pobre", y = "Tamaño del hogar") +
+  theme_minimal()
+
+p2 <- ggplot(df, aes(x = factor(pobre), y = ocupados)) +
+  geom_boxplot(fill = "#E30613", alpha = 0.6) +
+  labs(x = "pobre", y = "Ocupados") +
+  theme_minimal()
+
+p3 <- ggplot(df, aes(x = factor(pobre), y = nivel_educativo)) +
+  geom_boxplot(fill = "#F4C300", alpha = 0.6) +
+  labs(x = "pobre", y = "Nivel educativo") +
+  theme_minimal()
+
+# Edad promedio, proporción ocupados y distribución del ingreso per cápita
+p4 <- ggplot(df, aes(x = factor(pobre), y = edad_promedio)) +
+  geom_boxplot(fill = "#F7A600", alpha = 0.6) +
+  labs(x = "pobre", y = "Edad promedio") +
+  theme_minimal()
+
+p5 <- ggplot(df, aes(x = factor(pobre), y = prop_ocupados)) +
+  geom_boxplot(fill = "#A0195B", alpha = 0.6) +
+  labs(x = "pobre", y = "Proporción ocupados") +
+  theme_minimal()
+
+p6 <- ggplot(df, aes(x = factor(pobre), y = ingtotug)) +
+  geom_violin(fill = "#0072CE", alpha = 0.6) +
+  scale_y_log10() +
+  labs(x = "pobre", y = "Ingreso per cápita (log)") +
+  theme_minimal()
+
+# Histogramas de ingreso, nivel educativo y tamaño del hogar
+p7 <- ggplot(df, aes(x = ingtotug, fill = factor(pobre))) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 50) +
+  scale_x_log10() +
+  labs(x = "Ingreso per cápita (log)", fill = "pobre") +
+  theme_minimal()
+
+p8 <- df %>%
+  count(nivel_educativo) %>%
+  filter(!is.na(nivel_educativo)) %>%
+  mutate(nivel_educativo = fct_reorder(as.factor(nivel_educativo), n, .desc = TRUE)) %>%
+  ggplot(aes(x = nivel_educativo, y = n)) +
+  geom_bar(stat = "identity", fill = "#0072CE") +
+  labs(x = "Nivel educativo promedio", y = "Frecuencia") +
+  theme_minimal()
+
+p9 <- ggplot(df, aes(x = n_personas)) +
+  geom_histogram(fill = "#A0195B", bins = 30) +
+  labs(x = "Tamaño del hogar", y = "Frecuencia") +
+  theme_minimal()
+install.packages("gridExtra")
+library(gridExtra)
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 3)
+
+```
+# 3 Modelos
+## 3.1 Elastic Net Regularizado
+
+El modelo Elastic Net combina las penalizaciones L1 (Lasso) y L2 (Ridge), lo que permite realizar selección de variables y reducir el sobreajuste, especialmente útil cuando hay colinealidad. Aquí se utiliza un `alpha = 0.5` que balancea ambos extremos. Se emplea validación cruzada con 5 folds para encontrar el `lambda` óptimo, evaluando el desempeño con el área bajo la curva (AUC).
+
+```{r}
+X_ext <- model.matrix(pobre ~ . -1, data = vars_modelo_ext)
+y_ext <- vars_modelo_ext$pobre
+
+set.seed(123)
+modelo_elastic_ext <- cv.glmnet(
+  x = X_ext,
+  y = y_ext,
+  family = "binomial",
+  alpha = 0.5,
+  nfolds = 5,
+  type.measure = "auc"
+)
+
+plot(modelo_elastic_ext)
+modelo_elastic_ext$lambda.min
+
+test_modelo_ext <- test_h %>%
+  left_join(vars_test_ext, by = "id") %>%
+  mutate(across(.cols = -id, .fns = ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+X_vars_test_ext_full <- model.matrix(~ . - id -1, data = test_modelo_ext)
+
+missing_cols <- setdiff(colnames(X_ext), colnames(X_vars_test_ext_full))
+for (col in missing_cols) {
+  X_vars_test_ext_full <- cbind(X_vars_test_ext_full, setNames(data.frame(rep(0, nrow(X_vars_test_ext_full))), col))
+}
+X_vars_test_ext <- X_vars_test_ext_full[, colnames(X_ext)]
+
+test_modelo_ext$prob_pred <- as.numeric(predict(modelo_elastic_ext, newx = X_vars_test_ext, s = "lambda.min", type = "response"))
+test_modelo_ext$pobre <- ifelse(test_modelo_ext$prob_pred > 0.5, 1, 0)
+
+```
+
+### 📊 CURVA ROC Y AUC
+
+```{r}
+roc_elastic_ext <- roc(response = as.numeric(test_modelo_ext$pobre),
+                       predictor = test_modelo_ext$prob_pred,
+                       levels = c(0,1))
+
+auc(roc_elastic_ext)
+
+plot(roc_elastic_ext, col = "darkgreen", lwd = 2, main = "ROC - Elastic Net Extendido")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+```
+
+### 💾 GUARDAR PREDICCIONES EN CSV
+
+```{r}
+predicciones_ext <- test_modelo_ext %>% select(id, pobre)
+write_csv(predicciones_ext, "predicciones_elastic_net_extendido.csv")
+```
+
+## 3.2 Árboles de Clasificación (CART)
+
+Los árboles de decisión tipo CART (Classification and Regression Trees) son modelos de clasificación que permiten segmentar los datos a través de reglas de decisión simples. Una de sus principales ventajas es su **interpretabilidad**, ya que permiten visualizar el proceso de clasificación de manera jerárquica. En este caso, utilizamos CART para predecir la condición de pobreza del hogar. A continuación se presenta la implementación completa:
+  
+  Se cargan las librerías necesarias:
+  - `caret`: para entrenamiento y validación cruzada.
+- `rpart`: para construir árboles de clasificación.
+- `rpart.plot`: para visualizar los árboles de decisión.
+- `MLmetrics`: para calcular métricas como el F1 Score.
+
+```{r}
+# Cargar librerías necesarias
+p_load(caret,
+       rpart,
+       rpart.plot,
+       MLmetrics)
+
+
+# Entrenamiento inicial del CART básico
+modelo_cart <- rpart(
+  formula = pobre ~ .,
+  data = vars_modelo_ext,
+  method = "class",
+  parms = list(split = "gini"),
+  control = rpart.control(cp = 0.01, minsplit = 20)
+)
+
+# Visualización del árbol inicial
+rpart.plot(
+  modelo_cart,
+  type = 2,
+  extra = 104,
+  under = TRUE,
+  fallen.leaves = TRUE,
+  box.palette = "Blues"
+)
+
+# Evaluación del modelo
+pred_entrenamiento <- predict(modelo_cart, newdata = vars_modelo_ext, type = "class")
+
+f1_cart <- F1_Score(
+  y_pred = as.character(pred_entrenamiento),
+  y_true = as.character(vars_modelo_ext$pobre),
+  positive = "1"
+)
+
+print(paste("F1 Score del CART en train:", round(f1_cart, 4)))
+
+# Segundo intento: CART con tuning de hiperparámetros
+set.seed(123)
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  summaryFunction = defaultSummary,
+  classProbs = TRUE
+)
+
+grid <- expand.grid(cp = seq(0.0001, 0.05, by = 0.002))
+
+vars_modelo_ext <- vars_modelo_ext %>%
+  mutate(pobre = factor(pobre, levels = c(0, 1), labels = c("no", "si")))
+
+modelo_cart_cv <- train(
+  pobre ~ .,
+  data = vars_modelo_ext,
+  method = "rpart",
+  trControl = ctrl,
+  tuneGrid = grid,
+  metric = "Accuracy"
+)
+
+print(modelo_cart_cv)
+plot(modelo_cart_cv)
+
+# Árbol final podado
+rpart.plot(
+  modelo_cart_cv$finalModel,
+  type = 2,
+  extra = 104,
+  under = TRUE,
+  fallen.leaves = TRUE,
+  box.palette = "Blues"
+)
+
+# Predicción y evaluación final
+pred_entrenamiento <- predict(modelo_cart_cv, newdata = vars_modelo_ext)
+
+f1_cart_cv <- F1_Score(
+  y_pred = pred_entrenamiento,
+  y_true = vars_modelo_ext$pobre,
+  positive = "si"
+)
+
+print(paste("F1 Score del CART podado (train):", round(f1_cart_cv, 4)))
+
+confusionMatrix(
+  data = pred_entrenamiento,
+  reference = vars_modelo_ext$pobre,
+  mode = "everything",
+  positive = "si"
+)
+```
+## 3.3 Ensamble de Logit y Random Forest
+
+En esta sección implementamos un modelo de ensamblaje que combina las predicciones de un modelo de regresión logística (logit) y un modelo de bosque aleatorio (Random Forest). El objetivo es aprovechar la capacidad explicativa y lineal del logit con la flexibilidad y poder de captura no lineal del Random Forest. Se ajustan ambos modelos, se realiza una combinación ponderada de las probabilidades, y se optimiza el peso del ensamblaje mediante validación cruzada para maximizar el F1-score.
+
+```{r}
+# ─────────────────────────────────────────────────────────────
+# 📦 CARGA DE PAQUETAS
+# ─────────────────────────────────────────────────────────────
+# 📦 Cargar librerías
+library(tidyverse)
+library(ranger)
+
+# 🎯 Entrenamiento del modelo Random Forest
+modelo_rf <- ranger(
+  formula = pobre ~ .,
+  data = vars_modelo_ext,
+  probability = TRUE,
+  num.trees = 100,
+  mtry = 3,
+  min.node.size = 20,
+  class.weights = c("0" = 1, "1" = 3),
+  seed = 123
+)
+
+# 🎯 Entrenamiento del modelo Logit
+modelo_logit <- glm(pobre ~ ., data = vars_modelo_ext, family = binomial)
+
+# 🔮 Predicción sobre el test (probabilidades)
+probs_logit <- predict(modelo_logit, newdata = vars_test_ext, type = "response")
+rf_pred <- predict(modelo_rf, data = vars_test_ext)$predictions
+probs_rf <- if ("1" %in% colnames(rf_pred)) rf_pred[, "1"] else rf_pred[, 1]
+
+# 🤝 Ensamble inicial de probabilidades (60% RF, 40% Logit)
+prob_ensamble <- 0.6 * probs_rf + 0.4 * probs_logit
+cutoff_final <- 0.33
+preds <- ifelse(prob_ensamble > cutoff_final, 1, 0)
+
+# 🎯 Preparación para validación cruzada del peso del ensamble
+set.seed(123)
+k <- 5
+n <- nrow(vars_modelo_ext)
+folds <- sample(rep(1:k, length.out = n))
+rf_weights <- seq(0.1, 0.9, by = 0.1)
+cutoff_ensamble <- 0.33
+grid_results <- list()
+
+# 🔁 Grid Search por el mejor peso
+for (w in rf_weights) {
+  logit_w <- 1 - w
+  fold_metrics <- list()
+  
+  for (fold in 1:k) {
+    train_fold <- vars_modelo_ext[folds != fold, ]
+    val_fold   <- vars_modelo_ext[folds == fold, ]
+    
+    modelo_rf <- ranger(
+      formula = pobre ~ .,
+      data = train_fold,
+      probability = TRUE,
+      num.trees = 100,
+      mtry = 3,
+      min.node.size = 20,
+      class.weights = c("0" = 1, "1" = 3),
+      seed = 123
+    )
+    rf_val_pred <- predict(modelo_rf, data = val_fold)$predictions
+    probs_rf <- if ("1" %in% colnames(rf_val_pred)) rf_val_pred[, "1"] else rf_val_pred[, 1]
+    
+    modelo_logit <- glm(pobre ~ ., data = train_fold, family = binomial)
+    probs_logit <- predict(modelo_logit, newdata = val_fold, type = "response")
+    
+    prob_final <- w * probs_rf + logit_w * probs_logit
+    pred <- ifelse(prob_final > cutoff_ensamble, 1, 0)
+    real <- val_fold$pobre
+    
+    tp <- sum(pred == 1 & real == 1)
+    tn <- sum(pred == 0 & real == 0)
+    fp <- sum(pred == 1 & real == 0)
+    fn <- sum(pred == 0 & real == 1)
+    
+    precision <- ifelse(tp + fp == 0, NA, tp / (tp + fp))
+    recall <- ifelse(tp + fn == 0, NA, tp / (tp + fn))
+    f1 <- ifelse(is.na(precision) | is.na(recall) | (precision + recall) == 0, NA,
+                 2 * precision * recall / (precision + recall))
+    
+    fold_metrics[[fold]] <- tibble(fold, precision, recall, f1)
+  }
+  
+  resumen <- bind_rows(fold_metrics) %>%
+    summarise(across(precision:f1, mean, na.rm = TRUE)) %>%
+    mutate(rf_weight = w, logit_weight = logit_w)
+  
+  grid_results[[length(grid_results) + 1]] <- resumen
+}
+
+# 📊 Tabla final ordenada por F1
+pesos_optimos <- bind_rows(grid_results) %>% arrange(desc(f1))
+print(pesos_optimos)
+
+# 🔮 Predicción final usando el mejor peso
+mejor_peso_rf <- pesos_optimos$rf_weight[1]
+mejor_peso_logit <- pesos_optimos$logit_weight[1]
+
+probs_logit_final <- predict(modelo_logit, newdata = vars_test_ext, type = "response")
+rf_pred_final <- predict(modelo_rf, data = vars_test_ext)$predictions
+probs_rf_final <- if ("1" %in% colnames(rf_pred_final)) rf_pred_final[, "1"] else rf_pred_final[, 1]
+
+prob_final <- mejor_peso_rf * probs_rf_final + mejor_peso_logit * probs_logit_final
+preds <- ifelse(prob_final > 0.33, 1, 0)
+
+# 💾 Exportar predicciones a archivo .csv
+salida <- tibble(id = vars_test_ext$id, pobre = preds)
+write_csv(salida, "predicciones_ensamble_optimo.csv")
+
+cat("✅ Archivo guardado: predicciones_ensamble_optimo.csv\n")
+cat("📊 Total predichos como pobres:", sum(salida$pobre), "\n")
+cat("📊 Total predichos como NO pobres:", sum(salida$pobre == 0), "\n")
+
+```
+XGBoost (Extreme Gradient Boosting) es un algoritmo de boosting basado en árboles de decisión que ha demostrado un excelente rendimiento en tareas de clasificación y regresión. Su eficiencia computacional y capacidad para capturar relaciones complejas lo convierten en una herramienta poderosa para este tipo de tareas. En esta sección se entrena un modelo XGBoost con validación cruzada para determinar el número óptimo de iteraciones (nrounds) y se selecciona el mejor punto de corte (cutoff) basado en el F1 score.
+
+```{r}
+# 📦 CARGA DE PAQUETES
+
+p_load(janitor,
+       xgboost,
+       purrr)
+
+
+# 📥 PREPARACIÓN DE DATOS
+train_xgb <- vars_modelo_ext %>%
+  filter(!is.na(pobre)) %>%
+  mutate(pobre = as.numeric(as.character(pobre))) %>%  # si es factor
+  mutate(pobre = ifelse(pobre == 1, 1, 0))              # fuerza a 0 y 1
+
+
+X <- as.matrix(train_xgb %>% select(-pobre))
+y <- train_xgb$pobre
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+# 🔁 VALIDACIÓN CRUZADA PARA ELEGIR nrounds
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  eta = 0.1,
+  max_depth = 4,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+set.seed(123)
+cv_result <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 1000,
+  nfold = 5,
+  early_stopping_rounds = 20,
+  verbose = 1
+)
+
+best_nrounds <- cv_result$best_iteration
+cat("🌲 Best nrounds:", best_nrounds, "
+")
+
+# 🧠 ENTRENAMIENTO FINAL
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  verbose = 1
+)
+
+# 🎯 AJUSTE DE CUTOFF
+probs_train <- predict(xgb_model, newdata = X)
+cutoffs <- seq(0.10, 0.50, by = 0.01)
+
+metricas_xgb <- map_dfr(cutoffs, function(cut) {
+  pred <- ifelse(probs_train > cut, 1, 0)
+  
+  tp <- sum(pred == 1 & y == 1)
+  tn <- sum(pred == 0 & y == 0)
+  fp <- sum(pred == 1 & y == 0)
+  fn <- sum(pred == 0 & y == 1)
+  
+  precision <- ifelse(tp + fp == 0, NA, tp / (tp + fp))
+  recall <- ifelse(tp + fn == 0, NA, tp / (tp + fn))
+  f1 <- ifelse(is.na(precision) | is.na(recall) | (precision + recall) == 0, NA,
+               2 * precision * recall / (precision + recall))
+  
+  tibble(cutoff = cut, precision, recall, f1)
+})
+
+mejor_cutoff <- metricas_xgb %>% arrange(desc(f1)) %>% slice_head(n = 1)
+print(mejor_cutoff)
+
+metricas_xgb %>%
+  ggplot(aes(x = cutoff, y = f1)) +
+  geom_line(color = "blue", size = 1.2) +
+  geom_point(size = 1.5) +
+  labs(title = "F1 Score vs Cutoff (XGBoost)", x = "Cutoff", y = "F1 Score") +
+  theme_minimal()
+
+# 🔮 PREDICCIONES SOBRE TEST
+X_test <- vars_test_ext %>%
+  select(all_of(colnames(X))) %>%
+  as.matrix()
+
+probs_test <- predict(xgb_model, newdata = X_test)
+final_cutoff <- mejor_cutoff$cutoff
+preds_test <- ifelse(probs_test > final_cutoff, 1, 0)
+
+# 💾 EXPORTAR
+submission <- tibble(id = vars_test_ext$id, pobre = preds_test)
+write_csv(submission, "predicciones_xgboost.csv")
+
+cat("✅ Archivo guardado: predicciones_xgboost.csv
+")
+cat("📊 Total pobres predichos:", sum(submission$pobre), "
+")
+cat("📊 Total NO pobres predichos:", sum(submission$pobre == 0), "
+")
+
+```
+
